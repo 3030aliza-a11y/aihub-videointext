@@ -15,15 +15,21 @@ const CORS_HEADERS = {
 
 const MAX_BYTES = 25 * 1024 * 1024; // giới hạn của OpenAI Whisper
 
+// Whisper chỉ nhận các đuôi này (không có mov/avi/mkv...) — mọi định dạng khác
+// được đổi tên thành mp4 trước khi gửi, Whisper vẫn giải mã đúng nội dung bên trong.
+const WHISPER_SUPPORTED_EXT = new Set(['flac', 'm4a', 'mp3', 'mp4', 'mpeg', 'mpga', 'oga', 'ogg', 'wav', 'webm']);
+
 const EXT_BY_CONTENT_TYPE = {
-  'video/mp4': 'mp4', 'audio/mp4': 'm4a', 'video/quicktime': 'mov', 'video/webm': 'webm',
+  'video/mp4': 'mp4', 'audio/mp4': 'm4a', 'video/quicktime': 'mp4', 'video/webm': 'webm',
   'audio/webm': 'webm', 'audio/mpeg': 'mp3', 'audio/mp3': 'mp3', 'audio/wav': 'wav',
-  'audio/x-wav': 'wav', 'audio/wave': 'wav', 'video/x-msvideo': 'avi', 'audio/ogg': 'ogg', 'video/ogg': 'ogv'
+  'audio/x-wav': 'wav', 'audio/wave': 'wav', 'video/x-msvideo': 'mp4', 'audio/ogg': 'ogg', 'video/ogg': 'ogg',
+  'audio/flac': 'flac', 'audio/x-flac': 'flac'
 };
 
 function extFromUrl(url) {
   const match = /\.([a-z0-9]{2,4})(?:\?|#|$)/i.exec(url);
-  return match ? match[1].toLowerCase() : null;
+  const ext = match ? match[1].toLowerCase() : null;
+  return ext && WHISPER_SUPPORTED_EXT.has(ext) ? ext : null;
 }
 
 function json(body, status) {

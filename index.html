@@ -146,6 +146,14 @@
 
   const MAX_BYTES = 25 * 1024 * 1024;
   const PAGE_LINK_RE = /(youtube\.com|youtu\.be|tiktok\.com|facebook\.com|fb\.watch|instagram\.com)/i;
+  // Whisper chỉ nhận các đuôi này; các đuôi khác (mov, avi, mkv...) đổi tên
+  // thành mp4 trước khi gửi — Whisper vẫn giải mã đúng nội dung âm thanh bên trong.
+  const WHISPER_SUPPORTED_EXT = new Set(['flac','m4a','mp3','mp4','mpeg','mpga','oga','ogg','wav','webm']);
+
+  function pickExt(file){
+    const nameExt = (file.name.split('.').pop() || '').toLowerCase();
+    return WHISPER_SUPPORTED_EXT.has(nameExt) ? nameExt : 'mp4';
+  }
 
   let mode = 'upload';
   const savedKey = localStorage.getItem('ttv_openai_key');
@@ -169,8 +177,15 @@
   fileInput.addEventListener('change', ()=>{
     const f = fileInput.files[0];
     if(!f){ fileMeta.textContent = ''; return; }
+    const isVideo = f.type.startsWith('video/');
     const over = f.size > MAX_BYTES;
-    fileMeta.innerHTML = `${f.name} — ${fmtSize(f.size)}` + (over ? ' <span style="color:var(--bad)">⚠️ vượt quá 25MB, hãy nén hoặc cắt ngắn video trước</span>' : '');
+    let extra = '';
+    if(isVideo){
+      extra = ' <span style="color:var(--muted)">— video sẽ tự động tách riêng âm thanh trước khi gửi để không bị giới hạn 25MB</span>';
+    } else if(over){
+      extra = ' <span style="color:var(--bad)">⚠️ file audio vượt quá 25MB, hãy cắt ngắn trước</span>';
+    }
+    fileMeta.innerHTML = `${f.name} — ${fmtSize(f.size)}` + extra;
   });
 
   function showStatus(kind, text){
@@ -179,6 +194,90 @@
   }
   function hideStatus(){
     statusEl.className = 'status';
+  }
+
+  function pickRecorderMime(){
+    const candidates = [
+      'audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'
+    ];
+    for(const m of candidates){
+      if(window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) return m;
+    }
+    return ''; // để trình duyệt tự chọn định dạng mặc định
+  }
+
+  // Phát video ngầm (không phát tiếng ra loa) và ghi lại riêng track âm thanh
+  // bằng Web Audio API + MediaRecorder — giúp file gửi đi nhỏ hơn nhiều so với
+  // gửi nguyên video, nên vượt được giới hạn 25MB của Whisper với video dài.
+  function extractAudio(file, onProgress){
+    return new Promise((resolve, reject)=>{
+      if(!window.MediaRecorder){
+        reject(new Error('Trình duyệt này không hỗ trợ tách âm thanh (MediaRecorder). Hãy thử Chrome mới nhất.'));
+        return;
+      }
+      const videoEl = document.createElement('video');
+      videoEl.style.cssText = 'position:fixed; left:-9999px; width:1px; height:1px;';
+      videoEl.muted = true;
+      videoEl.playsInline = true;
+      document.body.appendChild(videoEl);
+
+      const objectUrl = URL.createObjectURL(file);
+      let audioCtx, recorder, settled = false;
+
+      function cleanup(){
+        try{ videoEl.pause(); }catch(e){}
+        URL.revokeObjectURL(objectUrl);
+        videoEl.remove();
+        if(audioCtx) audioCtx.close().catch(()=>{});
+      }
+      function fail(err){
+        if(settled) return;
+        settled = true;
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+
+      videoEl.addEventListener('error', ()=> fail(new Error('Không đọc được file video để tách âm thanh.')));
+
+      videoEl.addEventListener('loadedmetadata', async ()=>{
+        try{
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaElementSource(videoEl);
+          const dest = audioCtx.createMediaStreamDestination();
+          source.connect(dest);
+          if(dest.stream.getAudioTracks().length === 0){
+            fail(new Error('Video này không có track âm thanh.'));
+            return;
+          }
+          if(audioCtx.state === 'suspended') await audioCtx.resume();
+
+          const mimeType = pickRecorderMime();
+          recorder = mimeType
+            ? new MediaRecorder(dest.stream, { mimeType, audioBitsPerSecond: 32000 })
+            : new MediaRecorder(dest.stream, { audioBitsPerSecond: 32000 });
+          const chunks = [];
+          recorder.ondataavailable = e=>{ if(e.data && e.data.size) chunks.push(e.data); };
+          recorder.onerror = e=> fail(e.error || new Error('Lỗi khi ghi âm thanh.'));
+          recorder.onstop = ()=>{
+            if(settled) return;
+            settled = true;
+            const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+            cleanup();
+            resolve(blob);
+          };
+
+          videoEl.addEventListener('ended', ()=>{ if(recorder.state !== 'inactive') recorder.stop(); });
+          videoEl.addEventListener('timeupdate', ()=>{
+            if(onProgress && videoEl.duration) onProgress(Math.min(1, videoEl.currentTime / videoEl.duration));
+          });
+
+          recorder.start();
+          await videoEl.play();
+        }catch(err){ fail(err); }
+      });
+
+      videoEl.src = objectUrl;
+    });
   }
 
   async function transcribeBlob(blob, filename, language){
@@ -205,9 +304,24 @@
   async function runUpload(){
     const f = fileInput.files[0];
     if(!f){ showStatus('error', 'Hãy chọn một file video/audio.'); return; }
-    if(f.size > MAX_BYTES){ showStatus('error', 'File vượt quá 25MB (giới hạn của Whisper). Hãy nén hoặc cắt ngắn video trước.'); return; }
-    showStatus('info', '⏳ Đang tải lên và xử lý... có thể mất từ vài chục giây đến vài phút.');
-    const text = await transcribeBlob(f, f.name, langSelect.value);
+
+    let blob = f, filename = f.name;
+    if(f.type.startsWith('video/')){
+      showStatus('info', '⏳ Đang tách âm thanh từ video (0%)... thời gian chờ tương đương độ dài video.');
+      blob = await extractAudio(f, (p)=> showStatus('info', `⏳ Đang tách âm thanh từ video (${Math.round(p*100)}%)... thời gian chờ tương đương độ dài video.`));
+      const ext = (blob.type || '').includes('mp4') ? 'm4a' : ((blob.type||'').includes('ogg') ? 'ogg' : 'webm');
+      filename = 'audio.' + ext;
+      if(blob.size > MAX_BYTES){
+        showStatus('error', 'Video quá dài, ngay cả sau khi tách âm thanh vẫn vượt quá 25MB. Hãy cắt ngắn video trước.');
+        return;
+      }
+    } else {
+      if(f.size > MAX_BYTES){ showStatus('error', 'File audio vượt quá 25MB (giới hạn của Whisper). Hãy cắt ngắn trước.'); return; }
+      filename = 'audio.' + pickExt(f);
+    }
+
+    showStatus('info', '⏳ Đang gửi và nhận diện giọng nói... có thể mất từ vài chục giây đến vài phút.');
+    const text = await transcribeBlob(blob, filename, langSelect.value);
     return text;
   }
 
